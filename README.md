@@ -114,6 +114,14 @@ Body(["key": "value"])
 Body("myBodyContent")
 Body(myJson)
 ```
+- `Timeout`
+
+Sets the timeout for a request or resource:
+```swift
+Timeout(60)
+Timeout(60, for: .request)
+Timeout(30, for: .resource)
+```
 - `RequestParam`
 
 Add a param directly
@@ -194,6 +202,17 @@ RequestChain {
 .call { (data, errors) in
     ...
 }
+```
+
+## Repeated Calls
+`.update` is used to run additional calls after the initial one. You can pass it either a number or a custom `Publisher`. You can also chain together multiple `.update`s. The two `.update`s in the following example are equivalent, so the end result is that the `Request` will be called once immediately and twice every 10 seconds thereafter.
+```swift
+Request {
+    Url("https://jsonplaceholder.typicode.com/todo")
+}
+.update(every: 10)
+.update(publisher: Timer.publish(every: 10, on: .main, in: .common).autoconnect())
+.call()
 ```
 
 ## Json

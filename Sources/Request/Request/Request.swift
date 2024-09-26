@@ -30,6 +30,7 @@ import Combine
 /// - Precondition: The `Request` body must contain **exactly one** `Url`
 public typealias Request = AnyRequest<Data>
 
+// TODO: Fix EXC_BAD_ACCESS instead of workaround with `struct`
 /// Tha base class of `Request` to be used with a `Codable` `ResponseType` when using the `onObject` callback
 ///
 /// *Example*:
@@ -40,9 +41,9 @@ public typealias Request = AnyRequest<Data>
 ///     .onObject { myCodableStructs in
 ///         ...
 ///     }
-public class AnyRequest<ResponseType>: ObservableObject, Identifiable where ResponseType: Decodable {
-    public var willChange = PassthroughSubject<AnyRequest, Never>()
-    
+public struct AnyRequest<ResponseType>/*: ObservableObject, Identifiable*/ where ResponseType: Decodable {
+    public let combineIdentifier = CombineIdentifier()
+
     private var params: CombinedParams
     
     private var onData: ((Data) -> Void)?
@@ -50,15 +51,16 @@ public class AnyRequest<ResponseType>: ObservableObject, Identifiable where Resp
     private var onJson: ((Json) -> Void)?
     private var onObject: ((ResponseType) -> Void)?
     private var onError: ((RequestError) -> Void)?
+    private var updatePublisher: AnyPublisher<Void,Never>?
     
-    @Published public var response: Response = Response()
+    /*@Published*/ public var response: Response = Response()
     
     public init(@RequestBuilder builder: () -> RequestParam) {
         let params = builder()
         if !(params is CombinedParams) {
             self.params = CombinedParams(children: [params])
         } else {
-            self.params = builder() as! CombinedParams
+            self.params = params as! CombinedParams
         }
         self.response = Response()
     }
@@ -68,38 +70,56 @@ public class AnyRequest<ResponseType>: ObservableObject, Identifiable where Resp
         self.response = Response()
     }
     
+    internal init(params: CombinedParams,
+                  onData: ((Data) -> Void)?,
+                  onString: ((String) -> Void)?,
+                  onJson: ((Json) -> Void)?,
+                  onObject: ((ResponseType) -> Void)?,
+                  onError: ((RequestError) -> Void)?,
+                  updatePublisher: AnyPublisher<Void,Never>?) {
+        self.params = params
+        self.onData = onData
+        self.onString = onString
+        self.onJson = onJson
+        self.onObject = onObject
+        self.onError = onError
+        self.updatePublisher = updatePublisher
+    }
+    
     /// Sets the `onData` callback to be run whenever `Data` is retrieved
     public func onData(_ callback: @escaping (Data) -> Void) -> Self {
-        self.onData = callback
-        return self
+        Self.init(params: params, onData: callback, onString: onString, onJson: onJson, onObject: onObject, onError: onError, updatePublisher: updatePublisher)
     }
     
     /// Sets the `onString` callback to be run whenever a `String` is retrieved
     public func onString(_ callback: @escaping (String) -> Void) -> Self {
-        self.onString = callback
-        return self
+        Self.init(params: params, onData: onData, onString: callback, onJson: onJson, onObject: onObject, onError: onError, updatePublisher: updatePublisher)
     }
     
     /// Sets the `onData` callback to be run whenever `Json` is retrieved
     public func onJson(_ callback: @escaping (Json) -> Void) -> Self {
-        self.onJson = callback
-        return self
+        Self.init(params: params, onData: onData, onString: onString, onJson: callback, onObject: onObject, onError: onError, updatePublisher: updatePublisher)
     }
     
     /// Sets the `onObject` callback to be run whenever `Data` is retrieved
     public func onObject(_ callback: @escaping (ResponseType) -> Void) -> Self {
-        self.onObject = callback
-        return self
+        Self.init(params: params, onData: onData, onString: onString, onJson: onJson, onObject: callback, onError: onError, updatePublisher: updatePublisher)
     }
     
     /// Handle any `RequestError`s thrown by the `Request`
     public func onError(_ callback: @escaping (RequestError) -> Void) -> Self {
-        self.onError = callback
-        return self
+        Self.init(params: params, onData: onData, onString: onString, onJson: onJson, onObject: onObject, onError: callback, updatePublisher: updatePublisher)
     }
     
     /// Performs the `Request`, and calls the `onData`, `onString`, `onJson`, and `onError` callbacks when appropriate.
     public func call() {
+        performRequest()
+        if let updatePublisher = self.updatePublisher {
+            updatePublisher.subscribe(self)
+        }
+    }
+
+    private func performRequest() {
         // Url
         guard var components = URLComponents(string: params.children!.filter({ $0.type == .url })[0].value as! String) else {
             fatalError("Missing Url in Request body")
@@ -143,40 +163,95 @@ public class AnyRequest<ResponseType>: ObservableObject, Identifiable where Resp
             request.httpBody = body[0].value as? Data
         }
         
+        // Configuration
+        let configuration = URLSessionConfiguration.default
+        let timeouts = params.children!.filter { $0.type == .timeout }
+        if timeouts.count > 0 {
+            for timeout in timeouts {
+                guard let (source, interval) = timeout.value as? (Timeout.Source, TimeInterval) else {
+                    fatalError("Invalid Timeout \(timeout)")
+                }
+                if source.contains(.request) {
+                    configuration.timeoutIntervalForRequest = interval
+                }
+                if source.contains(.resource) {
+                    configuration.timeoutIntervalForResource = interval
+                }
+            }
+        }
+        
+        
         // PERFORM REQUEST
-        URLSession.shared.dataTask(with: request) { data, res, err in
-            if res != nil {
-                let statusCode = (res as! HTTPURLResponse).statusCode
+        URLSession(configuration: configuration).dataTask(with: request) { data, res, err in
+            if let res = res as? HTTPURLResponse {
+                let statusCode = res.statusCode
                 if statusCode < 200 || statusCode >= 300 {
-                    if self.onError != nil {
-                        self.onError!(RequestError(statusCode: statusCode, error: data))
+                    if let onError = self.onError {
+                        onError(RequestError(statusCode: statusCode, error: data))
                         return
                     }
                 }
+            } else if let err = err, let onError = self.onError {
+                onError(RequestError(statusCode: -1, error: err.localizedDescription.data(using: .utf8)))
             }
-            if data != nil {
-                if self.onData != nil {
-                    self.onData!(data!)
+            if let data = data {
+                if let onData = self.onData {
+                    onData(data)
                 }
-                if self.onString != nil {
-                    if let string = String(data: data!, encoding: .utf8) {
-                        self.onString!(string)
+                if let onString = self.onString {
+                    if let string = String(data: data, encoding: .utf8) {
+                        onString(string)
                     }
                 }
-                if self.onJson != nil {
-                    if let string = String(data: data!, encoding: .utf8) {
+                if let onJson = self.onJson {
+                    if let string = String(data: data, encoding: .utf8) {
                         if let json = try? Json(string) {
-                            self.onJson!(json)
+                            onJson(json)
                         }
                     }
                 }
-                if self.onObject != nil {
-                    if let decoded = try? JSONDecoder().decode(ResponseType.self, from: data!) {
-                        self.onObject!(decoded)
+                if let onObject = self.onObject {
+                    if let decoded = try? JSONDecoder().decode(ResponseType.self, from: data) {
+                        onObject(decoded)
                     }
                 }
                 self.response.data = data
             }
         }.resume()
+    }
+
+    /// Sets the `Request` to be performed additional times after the initial `call`
+    public func update<T: Publisher>(publisher: T) -> Self {
+        var newPublisher = publisher
+            .map {_ in Void()}
+            .assertNoFailure()
+            .eraseToAnyPublisher()
+        if let updatePublisher = self.updatePublisher {
+            newPublisher = newPublisher.merge(with: updatePublisher).eraseToAnyPublisher()
+        }
+        return Self.init(params: params, onData: onData, onString: onString, onJson: onJson, onObject: onObject, onError: onError, updatePublisher: newPublisher)
+    }
+
+    /// Sets the `Request` to be repeated periodically after the initial `call`
+    public func update(every seconds: TimeInterval) -> Self {
+        self.update(publisher: Timer.publish(every: seconds, on: .main, in: .common).autoconnect())
+    }
+}
+
+extension AnyRequest : Subscriber {
+    public typealias Input = Void
+    public typealias Failure = Never
+
+    public func receive(subscription: Subscription) {
+        subscription.request(.unlimited)
+    }
+
+    public func receive(_ input: Void) -> Subscribers.Demand {
+        self.performRequest()
+        return .none
+    }
+
+    public func receive(completion: Subscribers.Completion<Never>) {
+        return
     }
 }
